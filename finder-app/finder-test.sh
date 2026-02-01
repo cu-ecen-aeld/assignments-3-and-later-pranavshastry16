@@ -3,8 +3,6 @@
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-make clean
-make
 
 # Tester script for assignment 1 and assignment 2
 # Author: Siddhant Jajoo
