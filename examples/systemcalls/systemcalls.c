@@ -1,4 +1,41 @@
+
+/******************************************************************
+ * Author : Pranav Shastry
+ * Email  : pranav.shastry@colorado.edu
+ * Date   : Feb 01st 2026
+ *
+ * Notes  :
+ * Assignment 3 part 1 code had been developed on the existing
+ * starter code which was available in the repo.
+ *
+ * AI Declaration :
+ * ChatGPT LLM was used during the development of the 3 functions.
+ * Exchange of back and forth prompts occured in order to make
+ * the functions comply with what the assignment exactly specifies.
+ * I reviewed each line of the code, made corrections wherever
+ * necessary.
+ *
+ * Link To Chat History :
+ * https://chatgpt.com/share/697fef67-8e78-8010-a16a-e091449b9870
+ *
+ *****************************************************************/
+
+
+
+
 #include "systemcalls.h"
+
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
+
+
 
 /**
  * @param cmd the command to execute with system()
@@ -9,15 +46,29 @@
 */
 bool do_system(const char *cmd)
 {
+    if(cmd == NULL)
+    {
+        return false;
+    }
 
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
+    errno = 0;
+    int status = system(cmd);
 
-    return true;
+    // system() failed to create a child, failed to fork, etc.
+    if(status == -1)
+    {
+        return false;
+    }
+
+    // If the child terminated normally, check its exit code.
+    if(WIFEXITED(status))
+    {
+        return (WEXITSTATUS(status) == 0);
+    }
+
+    // If it didn't exit normally (e.g., killed by a signal, stopped),
+    // treat that as failure per your spec.
+    return false;
 }
 
 /**
@@ -38,30 +89,73 @@ bool do_exec(int count, ...)
 {
     va_list args;
     va_start(args, count);
-    char * command[count+1];
+
+    char *command[count + 1];
     int i;
-    for(i=0; i<count; i++)
+
+    for(i = 0; i < count; i++)
     {
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
-/*
- * TODO:
- *   Execute a system command by calling fork, execv(),
- *   and wait instead of system (see LSP page 161).
- *   Use the command[0] as the full path to the command to execute
- *   (first argument to execv), and use the remaining arguments
- *   as second argument to the execv() command.
- *
-*/
+    // Optional: basic input validation
+    if(count < 1 || command[0] == NULL)
+    {
+        va_end(args);
+        return false;
+    }
+
+    /*
+     * Execute a system command by calling fork, execv(),
+     * and waitpid instead of system.
+     * Use command[0] as the full path to the command to execute,
+     * and the full command[] vector as argv (NULL terminated).
+     */
+
+    pid_t pid = fork();
+    if(pid < 0)
+    {
+        // fork failed
+        va_end(args);
+        return false;
+    }
+
+    if(pid == 0)
+    {
+        // Child: execv replaces the process image on success
+        execv(command[0], command);
+
+        // If execv returns, it failed. Use _exit (not exit).
+        _exit(127);
+    }
+
+    // Parent: wait for the child to complete
+    int status = 0;
+    pid_t w;
+    do
+    {
+        w = waitpid(pid, &status, 0);
+    }
+    while(w == -1 && errno == EINTR);
+
+    if(w == -1)
+    {
+        // waitpid failed
+        va_end(args);
+        return false;
+    }
 
     va_end(args);
 
-    return true;
+    // Return true only if child exited normally with status 0
+    if(WIFEXITED(status))
+    {
+        return (WEXITSTATUS(status) == 0);
+    }
+
+    // If terminated by signal or otherwise not a normal exit, fail
+    return false;
 }
 
 /**
@@ -73,27 +167,80 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
 {
     va_list args;
     va_start(args, count);
-    char * command[count+1];
+
+    char *command[count + 1];
     int i;
-    for(i=0; i<count; i++)
+    for(i = 0; i < count; i++)
     {
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
+    // Basic validation (recommended)
+    if(outputfile == NULL || count < 1 || command[0] == NULL)
+    {
+        va_end(args);
+        return false;
+    }
 
-/*
- * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
- *   redirect standard out to a file specified by outputfile.
- *   The rest of the behaviour is same as do_exec()
- *
-*/
+    pid_t pid = fork();
+    if(pid < 0)
+    {
+        // fork failed
+        va_end(args);
+        return false;
+    }
+
+    if(pid == 0)
+    {
+        // ---- Child ----
+        // Open (or create) output file for stdout redirection.
+        // Common behavior: truncate existing file.
+        int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if(fd < 0)
+	{
+            _exit(127);
+        }
+
+        // Redirect STDOUT to the file.
+        if(dup2(fd, STDOUT_FILENO) < 0)
+	{
+            close(fd);
+            _exit(127);
+        }
+
+        // fd is no longer needed after dup2 (stdout now points to the file)
+        close(fd);
+
+        // Execute the command. command[0] must be an absolute path per your spec.
+        execv(command[0], command);
+
+        // If execv returns, it failed.
+        _exit(127);
+    }
+
+    // ---- Parent ----
+    int status = 0;
+    pid_t w;
+    do
+    {
+        w = waitpid(pid, &status, 0);
+    }
+    while (w == -1 && errno == EINTR);
 
     va_end(args);
 
-    return true;
+    if(w == -1)
+    {
+        // waitpid failed
+        return false;
+    }
+
+    // Success only if child exited normally with exit status 0
+    if(WIFEXITED(status))
+    {
+        return (WEXITSTATUS(status) == 0);
+    }
+
+    return false;
 }
