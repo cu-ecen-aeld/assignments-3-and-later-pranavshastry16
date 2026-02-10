@@ -6,3 +6,26 @@ crosstool-ng
 aesd-build
 .vscode/
 test.sh.log
+
+# GitHub Actions self-hosted runner (do not commit)
+.credentials
+.credentials_rsaparams
+.env
+.path
+.runner
+_diag/
+_work/
+actions-runner-linux-*.tar.gz
+bin/
+config.sh
+env.sh
+externals/
+run-helper.cmd.template
+run-helper.sh
+run-helper.sh.template
+run.sh
+safe_sleep.sh
+svc.sh
+testfile.txt
+*.swp
+*.swo
