@@ -6,3 +6,20 @@ crosstool-ng
 aesd-build
 .vscode/
 test.sh.log
+
+# Local/github actions runner artifacts (DO NOT COMMIT)
+_work/
+_diag/
+actions-runner*/
+actions-runner5/
+.credentials
+.credentials_rsaparams
+.env
+.path
+bin/
+externals/
+server/aesdsocket
+server/valgrind-out.txt
+testfile.txt
+.runner
+actions-runner-*.tar.gz
