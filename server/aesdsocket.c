@@ -328,17 +328,17 @@ static int send_file_to_client(int client_fd)
  */
 static int handle_client(int client_fd)
 {
-    char *packet = NULL;      /* dynamic buffer holding the full client payload */
-    size_t packet_len = 0;    /* number of valid bytes currently stored in packet */
+    char *packet = NULL;      /* dynamic buffer holding the client payload */
+    size_t packet_len = 0;    /* current valid bytes in packet */
     char buf[RECV_CHUNK];     /* temporary recv buffer */
 
     /*
-     * Receive all data sent by this client connection.
+     * Receive one logical client request.
      *
-     * In Assignment 8 char-device mode, aesdchar expects newline-terminated
-     * commands. sockettest, however, sends one client payload like "abcdefg"
-     * and expects that to be treated as one complete command. So we receive
-     * the full client payload first, then append '\n' before writing it to
+     * For Assignment 8 char-device mode, sockettest sends one payload such as
+     * "abcdefg" and expects the server to treat that as one full command.
+     * The aesdchar driver itself needs newline-terminated commands, so once
+     * we receive the client payload, we append '\n' before writing it to
      * /dev/aesdchar.
      */
     while (!g_exit_requested) {
@@ -352,14 +352,14 @@ static int handle_client(int client_fd)
         }
 
         /*
-         * recv() == 0 means the client has finished sending the request.
+         * If the peer closed without sending anything further, stop receiving.
          */
         if (r == 0) {
             break;
         }
 
         /*
-         * Grow packet buffer and append received bytes.
+         * Grow the packet buffer and append the newly received bytes.
          */
         char *newbuf = realloc(packet, packet_len + (size_t)r);
         if (!newbuf) {
@@ -370,10 +370,28 @@ static int handle_client(int client_fd)
         packet = newbuf;
         memcpy(packet + packet_len, buf, (size_t)r);
         packet_len += (size_t)r;
+
+#ifdef USE_AESD_CHAR_DEVICE
+        /*
+         * In char-device mode, treat the first received payload for this
+         * connection as the full command and stop receiving more.
+         * This matches sockettest behavior and avoids blocking forever
+         * waiting for the client to close first.
+         */
+        break;
+#else
+        /*
+         * In the original file-backed behavior, commands were newline-driven.
+         * If a newline is found, we have a complete request.
+         */
+        if (memchr(buf, '\n', (size_t)r) != NULL) {
+            break;
+        }
+#endif
     }
 
     /*
-     * Nothing received from client.
+     * Nothing received from the client.
      */
     if (packet_len == 0) {
         free(packet);
@@ -382,8 +400,8 @@ static int handle_client(int client_fd)
 
 #ifdef USE_AESD_CHAR_DEVICE
     /*
-     * The char driver commits data only when newline is present.
-     * Append '\n' so one socket request becomes one driver command.
+     * Append newline because aesdchar only commits completed commands when
+     * it sees '\n'.
      */
     char *writebuf = malloc(packet_len + 1);
     if (!writebuf) {
@@ -403,7 +421,7 @@ static int handle_client(int client_fd)
     free(writebuf);
 #else
     /*
-     * Original file-backed behavior.
+     * Original file-backed behavior writes the received request as-is.
      */
     if (append_packet_to_file(packet, packet_len) != 0) {
         free(packet);
@@ -412,7 +430,7 @@ static int handle_client(int client_fd)
 #endif
 
     /*
-     * Send full accumulated contents back to the client.
+     * Send back the full accumulated contents.
      */
     if (send_file_to_client(client_fd) != 0) {
         free(packet);
@@ -422,6 +440,7 @@ static int handle_client(int client_fd)
     free(packet);
     return 0;
 }
+
 
 
 #ifndef USE_AESD_CHAR_DEVICE
