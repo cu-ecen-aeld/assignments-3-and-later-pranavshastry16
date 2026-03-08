@@ -3,6 +3,13 @@
  *
  *  Created on: March 1st, 2020
  *      Author: Dan Walkes
+ *
+ *  Modified by Pranav Shastry for AESD Assignment 8
+ *
+ *  Purpose:
+ *      This header defines the circular buffer structures and APIs used by
+ *      both the Assignment 7 userspace circular buffer logic and the
+ *      Assignment 8 aesdchar kernel driver.
  */
 
 #ifndef AESD_CIRCULAR_BUFFER_H
@@ -11,73 +18,111 @@
 #ifdef __KERNEL__
 #include <linux/types.h>
 #else
-#include <stddef.h> // size_t
-#include <stdint.h> // uintx_t
-#include <stdbool.h>
+#include <stddef.h>   /* size_t */
+#include <stdint.h>   /* uint8_t */
+#include <stdbool.h>  /* bool */
 #endif
 
+/*
+ * The circular buffer stores the 10 most recent complete write operations.
+ */
 #define AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED 10
 
+/*
+ * Represents one stored write operation.
+ *
+ * buffptr points to the beginning of the stored command buffer.
+ * size gives the number of valid bytes in that command buffer.
+ */
 struct aesd_buffer_entry
 {
-    /**
-     * A location where the buffer contents in buffptr are stored
-     */
     const char *buffptr;
-    /**
-     * Number of bytes stored in buffptr
-     */
     size_t size;
 };
 
+/*
+ * Circular buffer metadata.
+ *
+ * entry[]   : storage for the last 10 complete write operations
+ * in_offs   : index where the next entry will be inserted
+ * out_offs  : index of the oldest valid entry
+ * full      : true when all 10 slots are occupied
+ */
 struct aesd_circular_buffer
 {
-    /**
-     * An array of pointers to memory allocated for the most recent write operations
-     */
-    struct aesd_buffer_entry  entry[AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED];
-    /**
-     * The current location in the entry structure where the next write should
-     * be stored.
-     */
+    struct aesd_buffer_entry entry[AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED];
     uint8_t in_offs;
-    /**
-     * The first location in the entry structure to read from
-     */
     uint8_t out_offs;
-    /**
-     * set to true when the buffer entry structure is full
-     */
     bool full;
 };
 
-extern struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
-            size_t char_offset, size_t *entry_offset_byte_rtn );
+/*
+ * Find the circular buffer entry corresponding to a linear character offset
+ * if all valid buffer entries were concatenated end-to-end.
+ *
+ * Parameters:
+ *   buffer                : circular buffer to search
+ *   char_offset           : zero-based offset into the concatenated data stream
+ *   entry_offset_byte_rtn : returned byte offset within the matching entry
+ *
+ * Returns:
+ *   Pointer to the matching aesd_buffer_entry if found
+ *   NULL if the requested offset is beyond the valid data stored
+ *
+ * Note:
+ *   Caller is responsible for any required locking.
+ */
+extern struct aesd_buffer_entry *
+aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
+                                                size_t char_offset,
+                                                size_t *entry_offset_byte_rtn);
 
+/*
+ * Add a completed write entry into the circular buffer.
+ *
+ * If the buffer is already full, the oldest entry is overwritten.
+ * In that case, the overwritten entry is returned so the caller can free any
+ * dynamically allocated memory associated with it.
+ *
+ * Parameters:
+ *   buffer    : circular buffer to modify
+ *   add_entry : entry to insert
+ *
+ * Returns:
+ *   The overwritten entry when the buffer was full
+ *   An empty entry { NULL, 0 } when no overwrite occurred
+ *
+ * Note:
+ *   Caller is responsible for any required locking.
+ */
+extern struct aesd_buffer_entry
+aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer,
+                               const struct aesd_buffer_entry *add_entry);
 
-extern struct aesd_buffer_entry aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry);
-
+/*
+ * Initialize the circular buffer to an empty state.
+ */
 extern void aesd_circular_buffer_init(struct aesd_circular_buffer *buffer);
 
-/**
- * Create a for loop to iterate over each member of the circular buffer.
- * Useful when you've allocated memory for circular buffer entries and need to free it
- * @param entryptr is a struct aesd_buffer_entry* to set with the current entry
- * @param buffer is the struct aesd_buffer * describing the buffer
- * @param index is a uint8_t stack allocated value used by this macro for an index
- * Example usage:
+/*
+ * Macro to iterate through all entries of the circular buffer storage array.
+ *
+ * This is especially useful when freeing dynamically allocated buffers during
+ * cleanup.
+ *
+ * Example:
+ *
  * uint8_t index;
- * struct aesd_circular_buffer buffer;
  * struct aesd_buffer_entry *entry;
- * AESD_CIRCULAR_BUFFER_FOREACH(entry,&buffer,index) {
- *      free(entry->buffptr);
+ * AESD_CIRCULAR_BUFFER_FOREACH(entry, &buffer, index) {
+ *     if (entry->buffptr) {
+ *         free((void *)entry->buffptr);
+ *     }
  * }
  */
-#define AESD_CIRCULAR_BUFFER_FOREACH(entryptr,buffer,index) \
-    for(index=0, entryptr=&((buffer)->entry[index]); \
-            index<AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; \
-            index++, entryptr=&((buffer)->entry[index]))
-
-
+#define AESD_CIRCULAR_BUFFER_FOREACH(entryptr, buffer, index)                 \
+    for ((index) = 0, (entryptr) = &((buffer)->entry[(index)]);               \
+         (index) < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;                   \
+         (index)++, (entryptr) = &((buffer)->entry[(index)]))
 
 #endif /* AESD_CIRCULAR_BUFFER_H */
