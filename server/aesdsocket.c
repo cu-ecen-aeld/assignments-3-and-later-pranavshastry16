@@ -270,6 +270,7 @@ static int append_packet_to_file(const char *buf, size_t len)
  * may block briefly. This is acceptable for this assignment and preserves the
  * "append then return entire file" behavior consistently.
  */
+
 static int send_file_to_client(int client_fd)
 {
     int fd = open(DATA_FILE, O_RDONLY);
@@ -293,39 +294,6 @@ static int send_file_to_client(int client_fd)
             break;
         }
 
-#ifdef USE_AESD_CHAR_DEVICE
-        /*
-         * In char-device mode, aesdsocket appends '\n' artificially so the
-         * driver will commit each command. The socket test, however, expects
-         * the original payload back without that extra newline. Therefore,
-         * strip '\n' bytes before sending back to the client.
-         */
-        char filtered[SEND_CHUNK];
-        size_t filtered_len = 0;
-
-        for (ssize_t i = 0; i < r; i++) {
-            if (out[i] != '\n') {
-                filtered[filtered_len++] = out[i];
-            }
-        }
-
-        size_t off = 0;
-        while (off < filtered_len) {
-            ssize_t s = send(client_fd, filtered + off, filtered_len - off, 0);
-            if (s < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                close(fd);
-                return -1;
-            }
-            if (s == 0) {
-                close(fd);
-                return -1;
-            }
-            off += (size_t)s;
-        }
-#else
         size_t off = 0;
         while (off < (size_t)r) {
             ssize_t s = send(client_fd, out + off, (size_t)r - off, 0);
@@ -342,7 +310,6 @@ static int send_file_to_client(int client_fd)
             }
             off += (size_t)s;
         }
-#endif
     }
 
     close(fd);
@@ -406,22 +373,43 @@ static int handle_client(int client_fd)
         packet_len += (size_t)r;
 
 #ifdef USE_AESD_CHAR_DEVICE
-        /*
-         * In char-device mode, treat the first received payload for this
-         * connection as the full command and stop receiving more.
-         * This matches sockettest behavior and avoids blocking forever
-         * waiting for the client to close first.
-         */
-        break;
-#else
-        /*
-         * In the original file-backed behavior, commands were newline-driven.
-         * If a newline is found, we have a complete request.
-         */
-        if (memchr(buf, '\n', (size_t)r) != NULL) {
-            break;
+    /*
+     * aesdchar commits commands on newline. If the socket payload already
+     * ends with '\n', write it as-is. Otherwise append exactly one '\n'.
+     */
+    const bool already_has_newline =
+        (packet_len > 0) && (packet[packet_len - 1] == '\n');
+
+    if (already_has_newline) {
+        if (append_packet_to_file(packet, packet_len) != 0) {
+            free(packet);
+            return -1;
         }
+    } else {
+        char *writebuf = malloc(packet_len + 1);
+        if (!writebuf) {
+            free(packet);
+            return -1;
+        }
+
+        memcpy(writebuf, packet, packet_len);
+        writebuf[packet_len] = '\n';
+
+        if (append_packet_to_file(writebuf, packet_len + 1) != 0) {
+            free(writebuf);
+            free(packet);
+            return -1;
+        }
+
+        free(writebuf);
+    }
+#else
+    if (append_packet_to_file(packet, packet_len) != 0) {
+        free(packet);
+        return -1;
+    }
 #endif
+
     }
 
     /*
