@@ -328,19 +328,38 @@ static int send_file_to_client(int client_fd)
  */
 static int handle_client(int client_fd)
 {
-    char *packet = NULL;      // dynamic buffer holding partially received line(s)
-    size_t packet_len = 0;    // current valid bytes in 'packet'
-    char buf[RECV_CHUNK];     // temporary recv buffer
+    char *packet = NULL;      /* dynamic buffer holding the full client payload */
+    size_t packet_len = 0;    /* number of valid bytes currently stored in packet */
+    char buf[RECV_CHUNK];     /* temporary recv buffer */
 
     /*
-     * Loop until client disconnects or server shutdown requested.
+     * Receive all data sent by this client connection.
+     *
+     * In Assignment 8 char-device mode, aesdchar expects newline-terminated
+     * commands. sockettest, however, sends one client payload like "abcdefg"
+     * and expects that to be treated as one complete command. So we receive
+     * the full client payload first, then append '\n' before writing it to
+     * /dev/aesdchar.
      */
     while (!g_exit_requested) {
         ssize_t r = recv(client_fd, buf, sizeof(buf), 0);
-        if (r <= 0) break; // 0 = orderly shutdown by peer, <0 = error
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(packet);
+            return -1;
+        }
 
         /*
-         * Grow packet buffer and append newly received bytes.
+         * recv() == 0 means the client has finished sending the request.
+         */
+        if (r == 0) {
+            break;
+        }
+
+        /*
+         * Grow packet buffer and append received bytes.
          */
         char *newbuf = realloc(packet, packet_len + (size_t)r);
         if (!newbuf) {
@@ -351,56 +370,53 @@ static int handle_client(int client_fd)
         packet = newbuf;
         memcpy(packet + packet_len, buf, (size_t)r);
         packet_len += (size_t)r;
+    }
 
-        /*
-         * Scan packet buffer for '\n' characters.
-         * Every time we find one, we have a complete packet to process.
-         */
-        size_t start = 0;
-        for (size_t i = 0; i < packet_len; i++) {
-            if (packet[i] == '\n') {
-                size_t one_len = i - start + 1; // include newline
+    /*
+     * Nothing received from client.
+     */
+    if (packet_len == 0) {
+        free(packet);
+        return 0;
+    }
 
-                /*
-                 * Append only the complete packet portion to the file.
-                 */
-                if (append_packet_to_file(packet + start, one_len) != 0) {
-                    free(packet);
-                    return -1;
-                }
+#ifdef USE_AESD_CHAR_DEVICE
+    /*
+     * The char driver commits data only when newline is present.
+     * Append '\n' so one socket request becomes one driver command.
+     */
+    char *writebuf = malloc(packet_len + 1);
+    if (!writebuf) {
+        free(packet);
+        return -1;
+    }
 
-                /*
-                 * Then send the whole file contents back to the client.
-                 * This mimics the Assignment 5 behavior.
-                 */
-            
-	                    if (send_file_to_client(client_fd) != 0) {
-                    free(packet);
-                    return -1;
-                }
+    memcpy(writebuf, packet, packet_len);
+    writebuf[packet_len] = '\n';
 
-                /*
-                 * In Assignment 5/8 style operation, once one complete
-                 * newline-terminated command has been received and the full
-                 * response has been sent, this client connection is complete.
-                 * Returning here allows the worker thread to close the socket,
-                 * which lets netcat and the autotest detect EOF cleanly.
-                 */
-                free(packet);
-                return 0;
-	    
-	    }
-        }
+    if (append_packet_to_file(writebuf, packet_len + 1) != 0) {
+        free(writebuf);
+        free(packet);
+        return -1;
+    }
 
-        /*
-         * If we consumed some bytes (processed one or more packets),
-         * shift the remaining partial packet to the front of the buffer.
-         */
-        if (start > 0) {
-            size_t remain = packet_len - start;
-            memmove(packet, packet + start, remain);
-            packet_len = remain;
-        }
+    free(writebuf);
+#else
+    /*
+     * Original file-backed behavior.
+     */
+    if (append_packet_to_file(packet, packet_len) != 0) {
+        free(packet);
+        return -1;
+    }
+#endif
+
+    /*
+     * Send full accumulated contents back to the client.
+     */
+    if (send_file_to_client(client_fd) != 0) {
+        free(packet);
+        return -1;
     }
 
     free(packet);
