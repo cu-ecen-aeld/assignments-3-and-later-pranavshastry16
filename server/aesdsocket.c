@@ -4,6 +4,13 @@
  *
  * Based on Assignment 5 Part 1 Program by Pranav Shastry
  *
+ *  Key changes for Assignment 8:
+ *  - Added USE_AESD_CHAR_DEVICE build switch, enabled by default in Makefile
+ *  - Redirected reads/writes to /dev/aesdchar instead of /var/tmp/aesdsocketdata
+ *  - Removed timestamp behavior in char-device mode
+ *  - Avoided keeping /dev/aesdchar open persistently so the driver can be unloaded during testing
+ *
+ *
  * Key changes for Assignment 6:
  *  - Thread-per-connection model (pthread_create after accept)
  *  - Thread tracking via singly-linked list (SLIST from sys/queue.h)
@@ -48,11 +55,20 @@
 #include <unistd.h>
 
 #define SERVER_PORT 9000
+
+#ifdef USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 #define BACKLOG 10
 #define RECV_CHUNK 1024
 #define SEND_CHUNK 1024
+
+#ifndef USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_PERIOD_SEC 10
+#endif
 
 /*
  * Global shutdown flag set by signal handler.
@@ -67,6 +83,10 @@ static volatile sig_atomic_t g_exit_requested = 0;
  */
 static int g_listen_fd = -1;
 
+
+
+#ifndef USE_AESD_CHAR_DEVICE
+
 /*
  * Mutex to protect access to the shared data file.
  * - Without this, multiple threads could write at the same time and interleave bytes.
@@ -78,6 +98,10 @@ static pthread_mutex_t g_file_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Timestamp thread handle so we can join it at shutdown.
  */
 static pthread_t g_timestamp_thread;
+
+#endif
+
+
 
 /*
  * Per-connection thread tracking node.
@@ -214,37 +238,29 @@ static int create_listening_socket(void)
  */
 static int append_packet_to_file(const char *buf, size_t len)
 {
-    int rc = 0;
-
-    /*
-     * Only one thread at a time can open+append+write the shared file.
-     */
-    pthread_mutex_lock(&g_file_mutex);
-
-    int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = open(DATA_FILE, O_WRONLY);
     if (fd < 0) {
-        pthread_mutex_unlock(&g_file_mutex);
         return -1;
     }
 
     /*
-     * Handle partial writes: loop until everything is written.
+     * Handle partial writes: loop until all bytes are written.
      */
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, buf + off, len - off);
         if (w < 0) {
             if (errno == EINTR) continue;
-            rc = -1;
-            break;
+            close(fd);
+            return -1;
         }
         off += (size_t)w;
     }
 
     close(fd);
-    pthread_mutex_unlock(&g_file_mutex);
-    return rc;
+    return 0;
 }
+
 
 /*
  * Read the entire data file and send it to the client.
@@ -256,38 +272,49 @@ static int append_packet_to_file(const char *buf, size_t len)
  */
 static int send_file_to_client(int client_fd)
 {
-    pthread_mutex_lock(&g_file_mutex);
-
     int fd = open(DATA_FILE, O_RDONLY);
     if (fd < 0) {
-        pthread_mutex_unlock(&g_file_mutex);
-        return 0;
+        return -1;
     }
 
     char out[SEND_CHUNK];
 
     while (1) {
-        /*
-         * Read file in chunks and send to socket.
-         */
         ssize_t r = read(fd, out, sizeof(out));
-        if (r <= 0) break;
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
 
-        /*
-         * send() may send fewer bytes than requested; loop until complete.
-         */
+        if (r == 0) {
+            break;
+        }
+
         size_t off = 0;
         while (off < (size_t)r) {
             ssize_t s = send(client_fd, out + off, (size_t)r - off, 0);
-            if (s <= 0) break;  // client disconnected or error
+            if (s < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                close(fd);
+                return -1;
+            }
+            if (s == 0) {
+                close(fd);
+                return -1;
+            }
             off += (size_t)s;
         }
     }
 
     close(fd);
-    pthread_mutex_unlock(&g_file_mutex);
     return 0;
 }
+
 
 /*
  * handle_client:
@@ -346,13 +373,23 @@ static int handle_client(int client_fd)
                  * Then send the whole file contents back to the client.
                  * This mimics the Assignment 5 behavior.
                  */
-                if (send_file_to_client(client_fd) != 0) {
+            
+	                    if (send_file_to_client(client_fd) != 0) {
                     free(packet);
                     return -1;
                 }
 
-                start = i + 1; // next packet begins after '\n'
-            }
+                /*
+                 * In Assignment 5/8 style operation, once one complete
+                 * newline-terminated command has been received and the full
+                 * response has been sent, this client connection is complete.
+                 * Returning here allows the worker thread to close the socket,
+                 * which lets netcat and the autotest detect EOF cleanly.
+                 */
+                free(packet);
+                return 0;
+	    
+	    }
         }
 
         /*
@@ -369,6 +406,9 @@ static int handle_client(int client_fd)
     free(packet);
     return 0;
 }
+
+
+#ifndef USE_AESD_CHAR_DEVICE
 
 /*
  * Timestamp thread:
@@ -415,6 +455,9 @@ static void *timestamp_thread_func(void *arg)
 
     return NULL;
 }
+
+#endif
+
 
 /*
  * Optional argument wrapper for connection thread.
@@ -536,11 +579,15 @@ int main(int argc, char *argv[])
     if (run_as_daemon && daemonize() != 0)
         return EXIT_FAILURE;
 
+#ifndef USE_AESD_CHAR_DEVICE
+
     /*
      * Start timestamp thread. It runs until g_exit_requested becomes true.
      */
     if (pthread_create(&g_timestamp_thread, NULL, timestamp_thread_func, NULL) != 0)
         return EXIT_FAILURE;
+#endif
+
 
     /*
      * Main accept loop:
@@ -646,18 +693,24 @@ int main(int argc, char *argv[])
         free(it);
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
+
     /*
      * Join timestamp thread last.
      * It will exit once g_exit_requested is set.
      */
     pthread_join(g_timestamp_thread, NULL);
+#endif
+
 
     /*
      * Cleanup resources.
      */
+#ifndef USE_AESD_CHAR_DEVICE
     unlink(DATA_FILE);
     pthread_mutex_destroy(&g_file_mutex);
-    closelog();
+#endif
 
+    closelog();
     return EXIT_SUCCESS;
 }

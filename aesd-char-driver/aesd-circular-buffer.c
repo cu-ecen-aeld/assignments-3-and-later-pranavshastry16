@@ -88,28 +88,47 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 * Adds entry @param add_entry to @param buffer in the location specified in buffer->in_offs.
 * If the buffer was already full, overwrites the oldest entry and advances buffer->out_offs to the
 * new start location.
-* Any necessary locking must be handled by the caller
+*
+* Returns the overwritten entry when the buffer was already full, otherwise returns
+* an empty entry with buffptr = NULL and size = 0.
+*
+* Any necessary locking must be handled by the caller.
 * Any memory referenced in @param add_entry must be allocated by and/or must have a lifetime managed by the caller.
 */
-void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
+struct aesd_buffer_entry aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer,
+                                                        const struct aesd_buffer_entry *add_entry)
 {
-    /**
-    * TODO: implement per description
-    */
+    struct aesd_buffer_entry overwritten_entry = {
+        .buffptr = NULL,
+        .size = 0
+    };
+
     if (!buffer || !add_entry) {
-        return;
+        return overwritten_entry;
     }
 
+    /*
+     * If the buffer is already full, the entry at in_offs is the oldest entry
+     * about to be replaced. Save it so the caller can free its dynamically
+     * allocated memory after insertion.
+     */
     if (buffer->full) {
+        overwritten_entry = buffer->entry[buffer->in_offs];
         buffer->out_offs = (uint8_t)((buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
     }
 
+    /* Store the new completed write command into the current insertion slot */
     buffer->entry[buffer->in_offs] = *add_entry;
 
+    /* Advance insertion pointer circularly */
     buffer->in_offs = (uint8_t)((buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
 
+    /* Buffer becomes full when in_offs wraps around to out_offs */
     buffer->full = (buffer->in_offs == buffer->out_offs);
+
+    return overwritten_entry;
 }
+
 
 /**
 * Initializes the circular buffer described by @param buffer to an empty struct
