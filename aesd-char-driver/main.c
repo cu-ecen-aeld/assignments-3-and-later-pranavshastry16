@@ -16,6 +16,11 @@
  *
  * Original author: Dan Walkes
  * Modified by: Pranav Shastry
+ *
+ * AI Declaration:
+ * ChatGPT LLM was used to take some assistance for sections of this assignment. An approach was given by the lLM and I worked towards implementing the functions. Wherever errors were encountered, assistance of the LLM was taken to debug and also generate some sections of the code. I have used the LLM to also generate some of the comments for the code I have written.
+ * Chat History Link : https://chatgpt.com/c/69ae5957-0f6c-832d-ae2d-f1b369b1600f
+ *
  */
 
 #include <linux/module.h>

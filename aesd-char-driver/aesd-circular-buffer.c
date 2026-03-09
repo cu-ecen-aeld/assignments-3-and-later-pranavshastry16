@@ -8,6 +8,10 @@
  *
  * Original author: Dan Walkes
  * Modified by: Pranav Shastry
+ *
+ *
+ * Assistance has been taken from chatGPT LLM for some approach guidance and debugging help. Link to the chat history is inside the server directory c files with regards to assignment 8 development.
+ *
  */
 
 #ifdef __KERNEL__
