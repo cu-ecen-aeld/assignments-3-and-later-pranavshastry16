@@ -232,9 +232,15 @@ static int create_listening_socket(void)
     return fd;
 }
 
+
 /*
- * Append a byte buffer to the shared data file.
- * Mutex-protected to prevent interleaving between threads.
+ * Append a byte buffer to the backend storage.
+ *
+ * In Assignment 8 char-device mode, DATA_FILE is /dev/aesdchar.
+ * We intentionally open the endpoint only when needed and close it
+ * immediately after the write. This is important because keeping the
+ * driver file descriptor open all the time can prevent the module from
+ * being unloaded during the automated tests.
  */
 static int append_packet_to_file(const char *buf, size_t len)
 {
@@ -244,22 +250,31 @@ static int append_packet_to_file(const char *buf, size_t len)
     }
 
     /*
-     * Handle partial writes: loop until all bytes are written.
+     * Handle partial writes correctly.
+     * A single write() call is not guaranteed to consume the full buffer.
      */
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, buf + off, len - off);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            /*
+             * If interrupted by a signal, retry the write.
+             */
+            if (errno == EINTR) {
+                continue;
+            }
+
             close(fd);
             return -1;
         }
+
         off += (size_t)w;
     }
 
     close(fd);
     return 0;
 }
+
 
 
 /*
@@ -270,7 +285,6 @@ static int append_packet_to_file(const char *buf, size_t len)
  * may block briefly. This is acceptable for this assignment and preserves the
  * "append then return entire file" behavior consistently.
  */
-
 static int send_file_to_client(int client_fd)
 {
     int fd = open(DATA_FILE, O_RDONLY);
@@ -283,17 +297,28 @@ static int send_file_to_client(int client_fd)
     while (1) {
         ssize_t r = read(fd, out, sizeof(out));
         if (r < 0) {
+            /*
+             * Retry on signal interruption.
+             */
             if (errno == EINTR) {
                 continue;
             }
+
             close(fd);
             return -1;
         }
 
+        /*
+         * read() == 0 means EOF.
+         */
         if (r == 0) {
             break;
         }
 
+        /*
+         * send() may also complete partially, so loop until all read bytes
+         * have been transmitted to the client.
+         */
         size_t off = 0;
         while (off < (size_t)r) {
             ssize_t s = send(client_fd, out + off, (size_t)r - off, 0);
@@ -301,13 +326,20 @@ static int send_file_to_client(int client_fd)
                 if (errno == EINTR) {
                     continue;
                 }
+
                 close(fd);
                 return -1;
             }
+
+            /*
+             * send() returning 0 is treated as failure here because the
+             * connection is no longer making progress.
+             */
             if (s == 0) {
                 close(fd);
                 return -1;
             }
+
             off += (size_t)s;
         }
     }
@@ -329,31 +361,27 @@ static int send_file_to_client(int client_fd)
  */
 static int handle_client(int client_fd)
 {
-    char *packet = NULL;      /* dynamic buffer holding the client payload */
-    size_t packet_len = 0;    /* current valid bytes in packet */
+    char *packet = NULL;      /* dynamic buffer holding received client payload */
+    size_t packet_len = 0;    /* number of valid bytes currently stored in packet */
     char buf[RECV_CHUNK];     /* temporary recv buffer */
 
-    /*
-     * Receive one logical client request.
-     *
-     * For Assignment 8 char-device mode, sockettest sends one payload such as
-     * "abcdefg" and expects the server to treat that as one full command.
-     * The aesdchar driver itself needs newline-terminated commands, so once
-     * we receive the client payload, we append '\n' before writing it to
-     * /dev/aesdchar.
-     */
     while (!g_exit_requested) {
         ssize_t r = recv(client_fd, buf, sizeof(buf), 0);
         if (r < 0) {
+            /*
+             * Retry recv if interrupted by a signal.
+             */
             if (errno == EINTR) {
                 continue;
             }
+
             free(packet);
             return -1;
         }
 
         /*
-         * If the peer closed without sending anything further, stop receiving.
+         * recv() == 0 means peer closed the connection.
+         * If no data was received before this, there is nothing to process.
          */
         if (r == 0) {
             break;
@@ -373,14 +401,41 @@ static int handle_client(int client_fd)
         packet_len += (size_t)r;
 
 #ifdef USE_AESD_CHAR_DEVICE
-    /*
-     * aesdchar commits commands on newline. If the socket payload already
-     * ends with '\n', write it as-is. Otherwise append exactly one '\n'.
-     */
-    const bool already_has_newline =
-        (packet_len > 0) && (packet[packet_len - 1] == '\n');
+        /*
+         * IMPORTANT:
+         * In Assignment 8 char-device mode, sockettest treats one client send
+         * as one complete logical request. Do not wait for '\n' from the socket
+         * and do not wait for the peer to close before deciding the request is
+         * complete. The first received payload is the request.
+         */
+        break;
+#else
+        /*
+         * Original file-backed behavior:
+         * treat newline as the end of one request.
+         */
+        if (memchr(buf, '\n', (size_t)r) != NULL) {
+            break;
+        }
+#endif
+    }
 
-    if (already_has_newline) {
+    /*
+     * If nothing was received, there is nothing to store or send back.
+     */
+    if (packet_len == 0) {
+        free(packet);
+        return 0;
+    }
+
+#ifdef USE_AESD_CHAR_DEVICE
+    /*
+     * aesdchar only commits a command when newline is present.
+     *
+     * If the socket payload already ends with '\n', send it as-is.
+     * Otherwise append exactly one newline before writing to the driver.
+     */
+    if (packet[packet_len - 1] == '\n') {
         if (append_packet_to_file(packet, packet_len) != 0) {
             free(packet);
             return -1;
@@ -404,46 +459,8 @@ static int handle_client(int client_fd)
         free(writebuf);
     }
 #else
-    if (append_packet_to_file(packet, packet_len) != 0) {
-        free(packet);
-        return -1;
-    }
-#endif
-
-    }
-
     /*
-     * Nothing received from the client.
-     */
-    if (packet_len == 0) {
-        free(packet);
-        return 0;
-    }
-
-#ifdef USE_AESD_CHAR_DEVICE
-    /*
-     * Append newline because aesdchar only commits completed commands when
-     * it sees '\n'.
-     */
-    char *writebuf = malloc(packet_len + 1);
-    if (!writebuf) {
-        free(packet);
-        return -1;
-    }
-
-    memcpy(writebuf, packet, packet_len);
-    writebuf[packet_len] = '\n';
-
-    if (append_packet_to_file(writebuf, packet_len + 1) != 0) {
-        free(writebuf);
-        free(packet);
-        return -1;
-    }
-
-    free(writebuf);
-#else
-    /*
-     * Original file-backed behavior writes the received request as-is.
+     * Non-char-device mode writes the packet exactly as received.
      */
     if (append_packet_to_file(packet, packet_len) != 0) {
         free(packet);
@@ -452,7 +469,8 @@ static int handle_client(int client_fd)
 #endif
 
     /*
-     * Send back the full accumulated contents.
+     * After storing the request, send the full accumulated contents back to
+     * the client, matching the original aesdsocket behavior.
      */
     if (send_file_to_client(client_fd) != 0) {
         free(packet);
@@ -462,7 +480,6 @@ static int handle_client(int client_fd)
     free(packet);
     return 0;
 }
-
 
 
 #ifndef USE_AESD_CHAR_DEVICE
