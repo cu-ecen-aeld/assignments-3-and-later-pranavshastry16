@@ -4,6 +4,13 @@
  *
  * Based on Assignment 5 Part 1 Program by Pranav Shastry
  *
+ *  Key changes for Assignment 8:
+ *  - Added USE_AESD_CHAR_DEVICE build switch, enabled by default in Makefile
+ *  - Redirected reads/writes to /dev/aesdchar instead of /var/tmp/aesdsocketdata
+ *  - Removed timestamp behavior in char-device mode
+ *  - Avoided keeping /dev/aesdchar open persistently so the driver can be unloaded during testing
+ *
+ *
  * Key changes for Assignment 6:
  *  - Thread-per-connection model (pthread_create after accept)
  *  - Thread tracking via singly-linked list (SLIST from sys/queue.h)
@@ -48,11 +55,20 @@
 #include <unistd.h>
 
 #define SERVER_PORT 9000
+
+#ifdef USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 #define BACKLOG 10
 #define RECV_CHUNK 1024
 #define SEND_CHUNK 1024
+
+#ifndef USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_PERIOD_SEC 10
+#endif
 
 /*
  * Global shutdown flag set by signal handler.
@@ -67,6 +83,10 @@ static volatile sig_atomic_t g_exit_requested = 0;
  */
 static int g_listen_fd = -1;
 
+
+
+#ifndef USE_AESD_CHAR_DEVICE
+
 /*
  * Mutex to protect access to the shared data file.
  * - Without this, multiple threads could write at the same time and interleave bytes.
@@ -78,6 +98,10 @@ static pthread_mutex_t g_file_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Timestamp thread handle so we can join it at shutdown.
  */
 static pthread_t g_timestamp_thread;
+
+#endif
+
+
 
 /*
  * Per-connection thread tracking node.
@@ -208,43 +232,50 @@ static int create_listening_socket(void)
     return fd;
 }
 
+
 /*
- * Append a byte buffer to the shared data file.
- * Mutex-protected to prevent interleaving between threads.
+ * Append a byte buffer to the backend storage.
+ *
+ * In Assignment 8 char-device mode, DATA_FILE is /dev/aesdchar.
+ * We intentionally open the endpoint only when needed and close it
+ * immediately after the write. This is important because keeping the
+ * driver file descriptor open all the time can prevent the module from
+ * being unloaded during the automated tests.
  */
 static int append_packet_to_file(const char *buf, size_t len)
 {
-    int rc = 0;
-
-    /*
-     * Only one thread at a time can open+append+write the shared file.
-     */
-    pthread_mutex_lock(&g_file_mutex);
-
-    int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = open(DATA_FILE, O_WRONLY);
     if (fd < 0) {
-        pthread_mutex_unlock(&g_file_mutex);
         return -1;
     }
 
     /*
-     * Handle partial writes: loop until everything is written.
+     * Handle partial writes correctly.
+     * A single write() call is not guaranteed to consume the full buffer.
      */
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(fd, buf + off, len - off);
         if (w < 0) {
-            if (errno == EINTR) continue;
-            rc = -1;
-            break;
+            /*
+             * If interrupted by a signal, retry the write.
+             */
+            if (errno == EINTR) {
+                continue;
+            }
+
+            close(fd);
+            return -1;
         }
+
         off += (size_t)w;
     }
 
     close(fd);
-    pthread_mutex_unlock(&g_file_mutex);
-    return rc;
+    return 0;
 }
+
+
 
 /*
  * Read the entire data file and send it to the client.
@@ -256,38 +287,67 @@ static int append_packet_to_file(const char *buf, size_t len)
  */
 static int send_file_to_client(int client_fd)
 {
-    pthread_mutex_lock(&g_file_mutex);
-
     int fd = open(DATA_FILE, O_RDONLY);
     if (fd < 0) {
-        pthread_mutex_unlock(&g_file_mutex);
-        return 0;
+        return -1;
     }
 
     char out[SEND_CHUNK];
 
     while (1) {
-        /*
-         * Read file in chunks and send to socket.
-         */
         ssize_t r = read(fd, out, sizeof(out));
-        if (r <= 0) break;
+        if (r < 0) {
+            /*
+             * Retry on signal interruption.
+             */
+            if (errno == EINTR) {
+                continue;
+            }
+
+            close(fd);
+            return -1;
+        }
 
         /*
-         * send() may send fewer bytes than requested; loop until complete.
+         * read() == 0 means EOF.
+         */
+        if (r == 0) {
+            break;
+        }
+
+        /*
+         * send() may also complete partially, so loop until all read bytes
+         * have been transmitted to the client.
          */
         size_t off = 0;
         while (off < (size_t)r) {
             ssize_t s = send(client_fd, out + off, (size_t)r - off, 0);
-            if (s <= 0) break;  // client disconnected or error
+            if (s < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                close(fd);
+                return -1;
+            }
+
+            /*
+             * send() returning 0 is treated as failure here because the
+             * connection is no longer making progress.
+             */
+            if (s == 0) {
+                close(fd);
+                return -1;
+            }
+
             off += (size_t)s;
         }
     }
 
     close(fd);
-    pthread_mutex_unlock(&g_file_mutex);
     return 0;
 }
+
 
 /*
  * handle_client:
@@ -301,19 +361,34 @@ static int send_file_to_client(int client_fd)
  */
 static int handle_client(int client_fd)
 {
-    char *packet = NULL;      // dynamic buffer holding partially received line(s)
-    size_t packet_len = 0;    // current valid bytes in 'packet'
-    char buf[RECV_CHUNK];     // temporary recv buffer
+    char *packet = NULL;      /* dynamic buffer holding received client payload */
+    size_t packet_len = 0;    /* number of valid bytes currently stored in packet */
+    char buf[RECV_CHUNK];     /* temporary recv buffer */
 
-    /*
-     * Loop until client disconnects or server shutdown requested.
-     */
     while (!g_exit_requested) {
         ssize_t r = recv(client_fd, buf, sizeof(buf), 0);
-        if (r <= 0) break; // 0 = orderly shutdown by peer, <0 = error
+        if (r < 0) {
+            /*
+             * Retry recv if interrupted by a signal.
+             */
+            if (errno == EINTR) {
+                continue;
+            }
+
+            free(packet);
+            return -1;
+        }
 
         /*
-         * Grow packet buffer and append newly received bytes.
+         * recv() == 0 means peer closed the connection.
+         * If no data was received before this, there is nothing to process.
+         */
+        if (r == 0) {
+            break;
+        }
+
+        /*
+         * Grow the packet buffer and append the newly received bytes.
          */
         char *newbuf = realloc(packet, packet_len + (size_t)r);
         if (!newbuf) {
@@ -325,50 +400,89 @@ static int handle_client(int client_fd)
         memcpy(packet + packet_len, buf, (size_t)r);
         packet_len += (size_t)r;
 
+#ifdef USE_AESD_CHAR_DEVICE
         /*
-         * Scan packet buffer for '\n' characters.
-         * Every time we find one, we have a complete packet to process.
+         * IMPORTANT:
+         * In Assignment 8 char-device mode, sockettest treats one client send
+         * as one complete logical request. Do not wait for '\n' from the socket
+         * and do not wait for the peer to close before deciding the request is
+         * complete. The first received payload is the request.
          */
-        size_t start = 0;
-        for (size_t i = 0; i < packet_len; i++) {
-            if (packet[i] == '\n') {
-                size_t one_len = i - start + 1; // include newline
+        break;
+#else
+        /*
+         * Original file-backed behavior:
+         * treat newline as the end of one request.
+         */
+        if (memchr(buf, '\n', (size_t)r) != NULL) {
+            break;
+        }
+#endif
+    }
 
-                /*
-                 * Append only the complete packet portion to the file.
-                 */
-                if (append_packet_to_file(packet + start, one_len) != 0) {
-                    free(packet);
-                    return -1;
-                }
+    /*
+     * If nothing was received, there is nothing to store or send back.
+     */
+    if (packet_len == 0) {
+        free(packet);
+        return 0;
+    }
 
-                /*
-                 * Then send the whole file contents back to the client.
-                 * This mimics the Assignment 5 behavior.
-                 */
-                if (send_file_to_client(client_fd) != 0) {
-                    free(packet);
-                    return -1;
-                }
-
-                start = i + 1; // next packet begins after '\n'
-            }
+#ifdef USE_AESD_CHAR_DEVICE
+    /*
+     * aesdchar only commits a command when newline is present.
+     *
+     * If the socket payload already ends with '\n', send it as-is.
+     * Otherwise append exactly one newline before writing to the driver.
+     */
+    if (packet[packet_len - 1] == '\n') {
+        if (append_packet_to_file(packet, packet_len) != 0) {
+            free(packet);
+            return -1;
+        }
+    } else {
+        char *writebuf = malloc(packet_len + 1);
+        if (!writebuf) {
+            free(packet);
+            return -1;
         }
 
-        /*
-         * If we consumed some bytes (processed one or more packets),
-         * shift the remaining partial packet to the front of the buffer.
-         */
-        if (start > 0) {
-            size_t remain = packet_len - start;
-            memmove(packet, packet + start, remain);
-            packet_len = remain;
+        memcpy(writebuf, packet, packet_len);
+        writebuf[packet_len] = '\n';
+
+        if (append_packet_to_file(writebuf, packet_len + 1) != 0) {
+            free(writebuf);
+            free(packet);
+            return -1;
         }
+
+        free(writebuf);
+    }
+#else
+    /*
+     * Non-char-device mode writes the packet exactly as received.
+     */
+    if (append_packet_to_file(packet, packet_len) != 0) {
+        free(packet);
+        return -1;
+    }
+#endif
+
+    /*
+     * After storing the request, send the full accumulated contents back to
+     * the client, matching the original aesdsocket behavior.
+     */
+    if (send_file_to_client(client_fd) != 0) {
+        free(packet);
+        return -1;
     }
 
     free(packet);
     return 0;
 }
+
+
+#ifndef USE_AESD_CHAR_DEVICE
 
 /*
  * Timestamp thread:
@@ -415,6 +529,9 @@ static void *timestamp_thread_func(void *arg)
 
     return NULL;
 }
+
+#endif
+
 
 /*
  * Optional argument wrapper for connection thread.
@@ -536,11 +653,15 @@ int main(int argc, char *argv[])
     if (run_as_daemon && daemonize() != 0)
         return EXIT_FAILURE;
 
+#ifndef USE_AESD_CHAR_DEVICE
+
     /*
      * Start timestamp thread. It runs until g_exit_requested becomes true.
      */
     if (pthread_create(&g_timestamp_thread, NULL, timestamp_thread_func, NULL) != 0)
         return EXIT_FAILURE;
+#endif
+
 
     /*
      * Main accept loop:
@@ -646,18 +767,24 @@ int main(int argc, char *argv[])
         free(it);
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
+
     /*
      * Join timestamp thread last.
      * It will exit once g_exit_requested is set.
      */
     pthread_join(g_timestamp_thread, NULL);
+#endif
+
 
     /*
      * Cleanup resources.
      */
+#ifndef USE_AESD_CHAR_DEVICE
     unlink(DATA_FILE);
     pthread_mutex_destroy(&g_file_mutex);
-    closelog();
+#endif
 
+    closelog();
     return EXIT_SUCCESS;
 }

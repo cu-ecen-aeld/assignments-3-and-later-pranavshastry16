@@ -3,7 +3,7 @@ SRC := aesdsocket.c
 OBJ := $(SRC:.c=.o)
 
 CC ?= $(CROSS_COMPILE)gcc
-CFLAGS ?= -Wall -Werror -O2
+CFLAGS ?= -Wall -Werror -O2 -DUSE_AESD_CHAR_DEVICE=1
 LDFLAGS ?=
 
 all: $(TARGET)
