@@ -8,28 +8,47 @@
 #ifndef AESD_CHAR_DRIVER_AESDCHAR_H_
 #define AESD_CHAR_DRIVER_AESDCHAR_H_
 
-#define AESD_DEBUG 1  //Remove comment on this line to enable debug
+#define AESD_DEBUG 1  // Remove comment on this line to enable debug
 
-#undef PDEBUG             /* undef it, just in case */
+#undef PDEBUG
 #ifdef AESD_DEBUG
 #  ifdef __KERNEL__
-     /* This one if debugging is on, and kernel space */
-#    define PDEBUG(fmt, args...) printk( KERN_DEBUG "aesdchar: " fmt, ## args)
+#    define PDEBUG(fmt, args...) printk(KERN_DEBUG "aesdchar: " fmt, ## args)
 #  else
-     /* This one for user space */
 #    define PDEBUG(fmt, args...) fprintf(stderr, fmt, ## args)
 #  endif
 #else
-#  define PDEBUG(fmt, args...) /* not debugging: nothing */
+#  define PDEBUG(fmt, args...)
 #endif
+
+#include <linux/cdev.h>
+#include <linux/mutex.h>
+#include "aesd-circular-buffer.h"
 
 struct aesd_dev
 {
-    /**
-     * TODO: Add structure(s) and locks needed to complete assignment requirements
+    /*
+     * Circular buffer holding the last 10 complete newline-terminated write commands.
      */
-    struct cdev cdev;     /* Char device structure      */
-};
+    struct aesd_circular_buffer circular_buffer;
 
+    /*
+     * Temporary working entry used to accumulate partial writes until a newline is received.
+     * Once the command becomes complete, this entry is pushed into the circular buffer.
+     */
+    struct aesd_buffer_entry working_entry;
+
+    /*
+     * Mutex protecting all accesses to the circular buffer and working entry.
+     * This ensures that multi-threaded or multi-process read/write activity
+     * does not corrupt driver state.
+     */
+    struct mutex lock;
+
+    /*
+     * Character device structure registered with the kernel.
+     */
+    struct cdev cdev;
+};
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */
