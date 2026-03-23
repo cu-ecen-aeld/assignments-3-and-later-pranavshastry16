@@ -5,12 +5,7 @@
  * This driver provides a /dev/aesdchar character device backed by a circular
  * buffer storing the 10 most recent complete write commands.
  *
- * Key Assignment 8 behavior:
- *   - Writes are accumulated until a newline '\n' is received
- *   - Each complete newline-terminated command is stored as one buffer entry
- *   - The 10 most recent complete commands are retained
- *   - Old overwritten commands are freed to avoid memory leaks
- *   - Reads expose the stored commands as one linear byte stream
+ * Modified for Assignment 9.
  *
  * Based on the "scull" character driver style from Linux Device Drivers.
  *
@@ -19,7 +14,8 @@
  *
  * AI Declaration:
  * ChatGPT LLM was used to take some assistance for sections of this assignment. An approach was given by the lLM and I worked towards implementing the functions. Wherever errors were encountered, assistance of the LLM was taken to debug and also generate some sections of the code. I have used the LLM to also generate some of the comments for the code I have written.
- * Chat History Link : https://chatgpt.com/share/69ae5f49-3594-8010-800c-14ac034312df
+ * 
+ * Assigment 9 Chat History Link : https://chatgpt.com/share/69c0ac6b-b854-8010-aaf6-cd386ac3283d
  *
  */
 
