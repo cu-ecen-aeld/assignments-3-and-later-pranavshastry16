@@ -5,12 +5,7 @@
  * This driver provides a /dev/aesdchar character device backed by a circular
  * buffer storing the 10 most recent complete write commands.
  *
- * Key Assignment 8 behavior:
- *   - Writes are accumulated until a newline '\n' is received
- *   - Each complete newline-terminated command is stored as one buffer entry
- *   - The 10 most recent complete commands are retained
- *   - Old overwritten commands are freed to avoid memory leaks
- *   - Reads expose the stored commands as one linear byte stream
+ * Modified for Assignment 9.
  *
  * Based on the "scull" character driver style from Linux Device Drivers.
  *
@@ -19,7 +14,8 @@
  *
  * AI Declaration:
  * ChatGPT LLM was used to take some assistance for sections of this assignment. An approach was given by the lLM and I worked towards implementing the functions. Wherever errors were encountered, assistance of the LLM was taken to debug and also generate some sections of the code. I have used the LLM to also generate some of the comments for the code I have written.
- * Chat History Link : https://chatgpt.com/share/69ae5f49-3594-8010-800c-14ac034312df
+ * 
+ * Assigment 9 Chat History Link : https://chatgpt.com/share/69c0ac6b-b854-8010-aaf6-cd386ac3283d
  *
  */
 
@@ -37,6 +33,10 @@
 
 #include "aesdchar.h"
 
+#include <linux/ioctl.h>
+
+#include "aesd_ioctl.h"
+
 /*
  * Use dynamically allocated major number.
  */
@@ -50,6 +50,12 @@ MODULE_LICENSE("Dual BSD/GPL");
  * Single global device instance for this assignment.
  */
 struct aesd_dev aesd_device;
+
+
+
+static loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
+
+static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 /**
  * @brief Open handler for /dev/aesdchar
@@ -92,6 +98,131 @@ static int aesd_release(struct inode *inode, struct file *filp)
     PDEBUG("release");
     return 0;
 }
+
+
+/**
+ * @brief Compute total number of valid bytes currently stored in the circular buffer.
+ *
+ * The circular buffer stores up to 10 complete write commands. This helper walks
+ * from the oldest valid entry to the newest valid entry and sums their sizes.
+ *
+ * Caller must hold dev->lock before calling this helper.
+ *
+ * @param buffer Circular buffer to inspect
+ * @return Total number of valid bytes stored across all active entries
+ */
+static size_t aesd_circular_buffer_total_size(struct aesd_circular_buffer *buffer)
+{
+    size_t total_size = 0;
+    uint8_t valid_entry_count;
+    uint8_t i;
+
+    if (buffer == NULL) {
+        return 0;
+    }
+
+    if (buffer->full) {
+        valid_entry_count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else if (buffer->in_offs >= buffer->out_offs) {
+        valid_entry_count = (uint8_t)(buffer->in_offs - buffer->out_offs);
+    } else {
+        valid_entry_count = (uint8_t)(AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED
+                            - buffer->out_offs + buffer->in_offs);
+    }
+
+    for (i = 0; i < valid_entry_count; i++) {
+        uint8_t entry_index =
+            (uint8_t)((buffer->out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+
+        if (buffer->entry[entry_index].buffptr != NULL) {
+            total_size += buffer->entry[entry_index].size;
+        }
+    }
+
+    return total_size;
+}
+
+
+/**
+ * @brief Convert an AESD ioctl seek request into an absolute file position.
+ *
+ * The write_cmd field identifies which stored complete write command to seek into,
+ * using zero-based indexing relative to the oldest currently stored command.
+ * The write_cmd_offset field identifies the zero-based byte offset within that
+ * command.
+ *
+ * Example:
+ *   commands = ["Grass\n", "Sentosa\n", "Singapore\n"]
+ *   write_cmd = 1, write_cmd_offset = 2
+ *   absolute position = len("Grass\n") + 2
+ *
+ * Caller must hold dev->lock before calling this helper.
+ *
+ * @param dev Device containing the circular buffer
+ * @param seekto User-provided ioctl seek description
+ * @param absolute_offset_rtn Returned absolute file position on success
+ * @return 0 on success, -EINVAL if command or offset is invalid
+ */
+static int aesd_adjust_file_offset(struct aesd_dev *dev,
+                                   const struct aesd_seekto *seekto,
+                                   loff_t *absolute_offset_rtn)
+{
+    uint8_t valid_entry_count;
+    uint8_t i;
+    loff_t running_offset = 0;
+
+    if ((dev == NULL) || (seekto == NULL) || (absolute_offset_rtn == NULL)) {
+        return -EINVAL;
+    }
+
+    if (dev->circular_buffer.full) {
+        valid_entry_count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else if (dev->circular_buffer.in_offs >= dev->circular_buffer.out_offs) {
+        valid_entry_count =
+            (uint8_t)(dev->circular_buffer.in_offs - dev->circular_buffer.out_offs);
+    } else {
+        valid_entry_count =
+            (uint8_t)(AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED
+            - dev->circular_buffer.out_offs + dev->circular_buffer.in_offs);
+    }
+
+    /*
+     * write_cmd must refer to one of the currently stored valid commands.
+     */
+    if (seekto->write_cmd >= valid_entry_count) {
+        return -EINVAL;
+    }
+
+    /*
+     * Walk valid entries from oldest to newest.
+     * Sum sizes of all commands before the target command.
+     * Then validate the requested byte offset within the target command.
+     */
+    for (i = 0; i < valid_entry_count; i++) {
+        uint8_t entry_index =
+            (uint8_t)((dev->circular_buffer.out_offs + i) %
+            AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+        struct aesd_buffer_entry *entry = &dev->circular_buffer.entry[entry_index];
+
+        if ((entry->buffptr == NULL) || (entry->size == 0)) {
+            continue;
+        }
+
+        if (i == seekto->write_cmd) {
+            if (seekto->write_cmd_offset >= entry->size) {
+                return -EINVAL;
+            }
+
+            *absolute_offset_rtn = running_offset + seekto->write_cmd_offset;
+            return 0;
+        }
+
+        running_offset += entry->size;
+    }
+
+    return -EINVAL;
+}
+
 
 /**
  * @brief Read from the device
@@ -271,7 +402,8 @@ static ssize_t aesd_write(struct file *filp, const char __user *buf,
     /*
      * A successful write reports that all input bytes were consumed.
      */
-    retval = count;
+retval = count;
+*f_pos += retval;
 
 out:
     mutex_unlock(&dev->lock);
@@ -279,15 +411,132 @@ out:
     return retval;
 }
 
+
+/**
+ * @brief Custom llseek implementation for /dev/aesdchar
+ *
+ * This driver exposes the circular buffer contents as one logical concatenated
+ * byte stream. llseek moves filp->f_pos within that logical byte stream.
+ *
+ * We use the kernel helper fixed_size_llseek() once we determine the current
+ * total size of valid data stored in the circular buffer.
+ *
+ * Supported whence values:
+ *   SEEK_SET : position = offset
+ *   SEEK_CUR : position = current + offset
+ *   SEEK_END : position = total_size + offset
+ *
+ * @param filp Open file pointer for this device instance
+ * @param offset Requested offset
+ * @param whence SEEK_SET / SEEK_CUR / SEEK_END
+ * @return New file position on success, negative error code on failure
+ */
+static loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    loff_t retval;
+    size_t total_size;
+    struct aesd_dev *dev = filp->private_data;
+
+    PDEBUG("llseek offset=%lld whence=%d", offset, whence);
+
+    if (mutex_lock_interruptible(&dev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    /*
+     * Compute the total currently readable byte count exposed by the device.
+     */
+    total_size = aesd_circular_buffer_total_size(&dev->circular_buffer);
+
+    /*
+     * Let the kernel helper handle SEEK_SET / SEEK_CUR / SEEK_END semantics
+     * and range validation against the current logical device size.
+     */
+    retval = fixed_size_llseek(filp, offset, whence, total_size);
+
+    mutex_unlock(&dev->lock);
+    return retval;
+}
+
+
+/**
+ * @brief unlocked_ioctl handler for AESDCHAR_IOCSEEKTO
+ *
+ * This ioctl allows userspace to seek directly to:
+ *   - a specific stored write command (zero-based from oldest valid command)
+ *   - a specific byte offset within that command
+ *
+ * The ioctl argument is a userspace pointer to struct aesd_seekto.
+ *
+ * @param filp Open file pointer for this device instance
+ * @param cmd ioctl command number
+ * @param arg userspace pointer to struct aesd_seekto
+ * @return 0 on success, negative error code on failure
+ */
+static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    long retval = 0;
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_seekto seekto;
+    loff_t new_offset = 0;
+
+    PDEBUG("ioctl cmd=0x%x", cmd);
+
+    /*
+     * Reject unsupported ioctl magic or command numbers.
+     */
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) {
+        return -ENOTTY;
+    }
+
+    if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) {
+        return -ENOTTY;
+    }
+
+    switch (cmd) {
+    case AESDCHAR_IOCSEEKTO:
+        /*
+         * Copy ioctl payload from userspace into kernel memory.
+         */
+        if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto))) {
+            return -EFAULT;
+        }
+
+        if (mutex_lock_interruptible(&dev->lock)) {
+            return -ERESTARTSYS;
+        }
+
+        /*
+         * Translate (write_cmd, write_cmd_offset) into one absolute file position.
+         */
+        retval = aesd_adjust_file_offset(dev, &seekto, &new_offset);
+        if (retval == 0) {
+            filp->f_pos = new_offset;
+        }
+
+        mutex_unlock(&dev->lock);
+        break;
+
+    default:
+        retval = -ENOTTY;
+        break;
+    }
+
+    return retval;
+}
+
+
 /*
  * File operations table for /dev/aesdchar
  */
 struct file_operations aesd_fops = {
-    .owner   = THIS_MODULE,
-    .read    = aesd_read,
-    .write   = aesd_write,
-    .open    = aesd_open,
-    .release = aesd_release,
+    .owner          = THIS_MODULE,
+    .read           = aesd_read,
+    .write          = aesd_write,
+    .open           = aesd_open,
+    .release        = aesd_release,
+    .llseek         = aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 /**

@@ -70,6 +70,12 @@
 #define TIMESTAMP_PERIOD_SEC 10
 #endif
 
+#ifdef USE_AESD_CHAR_DEVICE
+#include "../aesd-char-driver/aesd_ioctl.h"
+#endif
+
+
+
 /*
  * Global shutdown flag set by signal handler.
  * - sig_atomic_t is used because it is safe to modify in a signal handler.
@@ -349,6 +355,184 @@ static int send_file_to_client(int client_fd)
 }
 
 
+#ifdef USE_AESD_CHAR_DEVICE
+/**
+ * @brief Parse a socket command of the form AESDCHAR_IOCSEEKTO:X,Y
+ *
+ * Accepts the command with or without a trailing newline, and also tolerates
+ * CRLF line endings.
+ *
+ * @param packet Buffer containing received client payload
+ * @param packet_len Number of bytes in packet
+ * @param seekto Output structure to fill on success
+ * @return true if packet is a valid ioctl seek command, false otherwise
+ */
+static bool parse_ioctl_seek_command(const char *packet, size_t packet_len,
+                                     struct aesd_seekto *seekto)
+{
+    const char *prefix = "AESDCHAR_IOCSEEKTO:";
+    size_t prefix_len = strlen(prefix);
+    char *parse_buffer = NULL;
+    unsigned int write_cmd;
+    unsigned int write_cmd_offset;
+    size_t trimmed_len;
+
+    if ((packet == NULL) || (seekto == NULL)) {
+        return false;
+    }
+
+    if (packet_len <= prefix_len) {
+        return false;
+    }
+
+    if (memcmp(packet, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    /*
+     * Trim one trailing '\n' and optional preceding '\r'
+     * so commands sent with line endings are still recognized.
+     */
+    trimmed_len = packet_len;
+
+    if ((trimmed_len > 0) && (packet[trimmed_len - 1] == '\n')) {
+        trimmed_len--;
+    }
+    if ((trimmed_len > 0) && (packet[trimmed_len - 1] == '\r')) {
+        trimmed_len--;
+    }
+
+    parse_buffer = malloc(trimmed_len + 1);
+    if (parse_buffer == NULL) {
+        return false;
+    }
+
+    memcpy(parse_buffer, packet, trimmed_len);
+    parse_buffer[trimmed_len] = '\0';
+
+    /*
+     * Require exact format after trimming line endings.
+     */
+    if (sscanf(parse_buffer, "AESDCHAR_IOCSEEKTO:%u,%u",
+               &write_cmd, &write_cmd_offset) != 2) {
+        free(parse_buffer);
+        return false;
+    }
+
+    /*
+     * Make sure nothing except digits/comma remains by regenerating and comparing.
+     */
+    {
+        char verify_buffer[64];
+        int written = snprintf(verify_buffer, sizeof(verify_buffer),
+                               "AESDCHAR_IOCSEEKTO:%u,%u",
+                               write_cmd, write_cmd_offset);
+
+        if ((written < 0) || ((size_t)written != strlen(parse_buffer)) ||
+            (strcmp(parse_buffer, verify_buffer) != 0)) {
+            free(parse_buffer);
+            return false;
+        }
+    }
+
+    seekto->write_cmd = write_cmd;
+    seekto->write_cmd_offset = write_cmd_offset;
+
+    free(parse_buffer);
+    return true;
+}
+#endif
+
+#ifdef USE_AESD_CHAR_DEVICE
+/**
+ * @brief Read from an already-open aesdchar fd and send data to client.
+ *
+ * This must use the same fd which received the ioctl, so the current file
+ * position set by ioctl is honored for the readback.
+ *
+ * @param device_fd Open /dev/aesdchar file descriptor
+ * @param client_fd Connected socket fd
+ * @return 0 on success, -1 on failure
+ */
+static int send_device_contents_from_fd(int device_fd, int client_fd)
+{
+    char out[SEND_CHUNK];
+
+    while (1) {
+        ssize_t r = read(device_fd, out, sizeof(out));
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+
+        if (r == 0) {
+            break;
+        }
+
+        size_t off = 0;
+        while (off < (size_t)r) {
+            ssize_t s = send(client_fd, out + off, (size_t)r - off, 0);
+            if (s < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (s == 0) {
+                return -1;
+            }
+            off += (size_t)s;
+        }
+    }
+
+    return 0;
+}
+#endif
+
+
+#ifdef USE_AESD_CHAR_DEVICE
+/**
+ * @brief Execute AESDCHAR_IOCSEEKTO on /dev/aesdchar and send readback.
+ *
+ * Opens the device with O_RDWR, performs the ioctl, then reads back from the
+ * same file descriptor so the file position set by ioctl is preserved.
+ *
+ * @param client_fd Connected socket fd
+ * @param seekto Parsed ioctl seek parameters
+ * @return 0 on success, -1 on failure
+ */
+static int handle_ioctl_seek_command(int client_fd,
+                                     const struct aesd_seekto *seekto)
+{
+    int device_fd;
+
+    if (seekto == NULL) {
+        return -1;
+    }
+
+    device_fd = open(DATA_FILE, O_RDWR);
+    if (device_fd < 0) {
+        return -1;
+    }
+
+    if (ioctl(device_fd, AESDCHAR_IOCSEEKTO, seekto) != 0) {
+        close(device_fd);
+        return -1;
+    }
+
+    if (send_device_contents_from_fd(device_fd, client_fd) != 0) {
+        close(device_fd);
+        return -1;
+    }
+
+    close(device_fd);
+    return 0;
+}
+#endif
+
+
 /*
  * handle_client:
  * - Receives data from a single client socket
@@ -427,6 +611,18 @@ static int handle_client(int client_fd)
         free(packet);
         return 0;
     }
+
+#ifdef USE_AESD_CHAR_DEVICE
+    {
+        struct aesd_seekto seekto;
+
+        if (parse_ioctl_seek_command(packet, packet_len, &seekto)) {
+            int ioctl_result = handle_ioctl_seek_command(client_fd, &seekto);
+            free(packet);
+            return ioctl_result;
+        }
+    }
+#endif
 
 #ifdef USE_AESD_CHAR_DEVICE
     /*
